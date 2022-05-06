@@ -1,0 +1,144 @@
+import pandas as pd
+import numpy as np
+import glob
+import warnings 
+warnings.simplefilter('ignore')
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import SGDClassifier, LinearRegression, ElasticNet, Lasso, Ridge
+
+
+path_data = '//...кту'
+'''
+
+import pandas as pd
+import numpy as np
+path = '//..test..//*.xlsx'
+
+all_data = pd.DataFrame()
+for f in glob.glob(path_data + '//train_dp//*.xlsx'):
+    df = pd.read_excel(f)
+    all_data = all_data.append(df, ignore_index = True)
+all_data.to_csv(path_data + '/trainData.csv')
+'''
+# DataFrame Russia/Country
+RuCountry = pd.read_excel(path_data + '/country_rusDP.xlsx')
+
+data = pd.read_csv(path_data + '/trainData.csv', encoding = 'cp1251')
+data = data.merge(RuCountry, on = 'Country', how = 'left').fillna('find_error')
+
+data['Fact_clear'] = data['Fact'] - data['netCountry']
+
+Countrys = data[['Country', 'article','fg1']]
+fg2 = data[(data['fg1'] == 'Косметика для дома')].fg2.unique()
+
+print( 'Count rows', len(data))
+
+data.head()
+
+Count_Country = Countrys.groupby('fg1')['article'].count().sort_values(ascending = False).reset_index()
+print(fg2)
+
+fg1_filter = list(Count_Country.iloc[:, 0])
+s = fg1_filter[8:]
+data = data[data.isin(s)['fg1'] == True]
+print( 'filter fg1 for df ->', s , 'filter fg2 ->' )
+# data = data[(data['fg2'] == 'Лицо') | (data['fg2'] =='Глаза')  | (data['fg2'] =='Аксессуары') ] #выставить дополнительный фильтр в случае нехватки памяти
+print('lenData' , len(data))
+data.head()
+
+# Feature engineering
+current_columns = ['Country', 'article', 'fg1', 'fg2', 'fg3', 'campaign', 'promoType', 'year', 'Fact_clear', 'DP_country' ]
+data = data[current_columns]
+# Filters
+data = data[(data['Country'] != 'Украина') & (data['Fact_clear'] > 1 )]
+# Concat Latvia and Poland
+data['Country'] = data['Country'].apply(lambda x: 'WesternEurope' if (x == 'Латвия') |( x == 'Польша' ) else x )
+
+# ---------------------------------
+# Unique column for merge
+data['uni'] = data['article']+ '_' + data['campaign']
+
+# Articls blocked 4-5 periods
+block = pd.read_excel(path_data + '/Блокировка_продаж_total block2.xlsx')
+block['Артикул'] = "`" + block['Артикул'].astype(str)
+block['uni'] = block['Артикул'] + '_' + block['periods']
+data = data.merge(block[['uni', 'Артикул']]  , on = 'uni', how = 'left' ).fillna('NotDel')
+data = data[data['Артикул'] == 'NotDel']
+data = data[current_columns]
+# --------------------------------
+# Pivot table 
+df = data.pivot_table(index = ['Country','article','campaign','promoType'] , 
+                      aggfunc = { 'Fact_clear': np.sum }).reset_index()
+# Type promo or catalog
+df['promoType'] = df['promoType'].apply(lambda x: 'catalog' if x =='в каталоге' else 'promo')
+# log(fact) for RidgModel
+df['lnFact'] = np.log(df['Fact_clear'])
+df = df.drop('Fact_clear', axis = 1)
+# Unique columns for RidgModel
+df['CountryArticle'] = df['Country'] + '_' + df['article']
+df['CampArticle'] = df['campaign'] + '_' + df['article']
+df['CatalogRRC'] = df['campaign'] + '_' + df['Country']
+df['RRCartPromo'] = df['Country'] + '_' + df['article'].astype(str) + '_' + df['promoType']
+df['RRCpromo'] = df['promoType'] + '_' + df['Country']
+# ------------------------------
+# GetDummies for marker 1/0
+CountryArticle = pd.get_dummies(df[['lnFact', 'CountryArticle']])
+CampArticle = pd.get_dummies(df[['lnFact', 'CampArticle']])
+CatalogRRC = pd.get_dummies(df[['lnFact', 'promoType', 'CatalogRRC']])
+RRCartPromo = pd.get_dummies(df[[ 'lnFact', 'RRCartPromo']])
+RRCpromo = pd.get_dummies(df[['lnFact', 'RRCpromo']])
+# Delete 5 period
+CatalogRRC.drop([ i for i in CatalogRRC.columns if '2022_05' in i[11:18]] , axis = 1, inplace = True)
+# -----------------------------
+df2 = pd.concat([CountryArticle, CampArticle, CatalogRRC, RRCartPromo, RRCpromo], axis = 1)
+# Delete duplicate columns in df2
+df2 = df2.loc[:,~df2.columns.duplicated()]
+# Для инфо
+print(' Кол-во столбцов:\n' , 'CountryArticle ',len(CountryArticle.columns), '\n CampArticle' , 
+      len(CampArticle.columns), '\n CatalogRRC ',len(CatalogRRC.columns) , 
+      '\n RRCartPromo' , len(RRCartPromo.columns),
+      '\n RRCpromo' , len(RRCpromo.columns)
+     , '\n Sum_columns ', len(CatalogRRC.columns)+ len(CountryArticle.columns)+len(CampArticle.columns) + len(RRCartPromo.columns)+len(RRCpromo.columns))
+
+
+df2.head()
+
+
+# RidgRegression 
+testX = df2.iloc[:,1:].values
+testY = df2['lnFact'].values
+
+def RidgRegression(df2):
+    X = testX
+    Y = testY
+    alpha = 0.01
+    regress = Ridge( alpha = alpha, fit_intercept = False ).fit(X,Y)
+    return(regress)
+Ridg = RidgRegression(df2)
+
+# Predict
+df_Ridg = df.copy()
+df_Ridg['predict'] = list(Ridg.predict( testX))
+df_Ridg['EXP(predict)'] = np.exp(df_Ridg['predict'])
+# Coefficients
+df_coeff = pd.DataFrame(data = df2.columns[1:], columns = ['TrainF'] )
+df_coeff['coeff_'] = list(Ridg.coef_)
+
+
+# accuracy check
+from sklearn.metrics import mean_absolute_error
+
+def accuracyRidg(df):
+    x = df['lnFact']
+    y = df['predict']
+    
+    expX = np.exp(x)
+    expY = np.exp(y)
+    return [ (mean_absolute_error(x,y) / np.mean(x), mean_absolute_error(expX, expY)/np.mean(expX) )]
+
+# unloading xls
+df_Ridg.to_excel(path_data + '//KTU// Other.xlsx')
+# Coefficients
+# df_coeff.to_excel(path_data+ '/Coeff_.xlsx')
+
+print(accuracyRidg(df_Ridg))
